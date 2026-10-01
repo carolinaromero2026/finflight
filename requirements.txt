@@ -1,0 +1,4 @@
+FlightRadarAPI==1.6.1
+pyarrow>=17
+boto3>=1.36
+numpy>=1.26
