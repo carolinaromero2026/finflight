@@ -1,25 +1,29 @@
-"""Una corrida: descarga posiciones de FR24 y sube un Parquet al bucket.
+"""Una corrida: descarga posiciones de FR24 y sube un CSV (gzip) al bucket.
 
 Diseñado para Railway cron: hace su trabajo y TERMINA. Si el proceso no sale,
 Railway se salta las ejecuciones siguientes, por eso hay un timeout duro.
 
+Formato: las 9 columnas del notebook, idénticas (nombre, orden, valores), y
+columnas extra al final. Mismo filtro: solo vuelos con `not vuelo.on_ground`.
+
 Modos (variable MODO):
-  global -> una sola request, igual que el notebook (FR24 la corta en ~1500 vuelos).
-  tiles  -> divide el mundo en cuadrantes y subdivide los que vuelven saturados,
-            para acercarse a cobertura completa. Más requests por corrida.
+  global -> solo la request única del notebook (FR24 la corta en ~1500 vuelos).
+  tiles  -> la request única del notebook + cuadrantes que se subdividen cuando
+            vuelven saturados. Las filas de la request única quedan marcadas con
+            en_muestra_global=True y son exactamente las que daría el notebook.
 """
-import io
+import gzip
 import json
 import signal
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pandas as pd
 from FlightRadarAPI import FlightRadar24API
 
-from common import PREFIX, SCHEMA, bucket, env, s3_client
+from common import COLUMNAS, PREFIX, bucket, env, s3_client
 
 MODO = env("MODO", "tiles")
 TILE_LIMIT = int(env("TILE_LIMIT", "1500"))          # tope observado por request
@@ -30,7 +34,9 @@ PAUSA_S = float(env("PAUSA_S", "0.3"))               # pausa entre requests
 REINTENTOS = int(env("REINTENTOS", "3"))
 TIMEOUT_S = int(env("RUN_TIMEOUT_S", "240"))         # < 300 s del intervalo del cron
 HTTP_TIMEOUT_S = int(env("HTTP_TIMEOUT_S", "20"))
-INCLUIR_EN_TIERRA = env("INCLUIR_EN_TIERRA", "0") == "1"
+# Zona horaria de fecha_hora_captura. El notebook usaba datetime.now() de la
+# máquina local; se asume que estaba en hora de Chile continental.
+TZ_CAPTURA = ZoneInfo(env("TZ_CAPTURA", "America/Santiago"))
 
 
 class Timeout(BaseException):
@@ -64,14 +70,13 @@ def _dividir(tile):
 
 
 def recolectar_global(api, stats):
+    """La misma llamada del notebook: fr_api.get_flights() sin argumentos."""
     stats["requests"] += 1
-    res = pedir(api)
-    if len(res) >= int(TILE_LIMIT * SPLIT_FRAC):
-        stats["tiles_saturados"] += 1
-    return res
+    return pedir(api)
 
 
 def recolectar_tiles(api, stats):
+    """Devuelve un dict id -> vuelo con la cobertura por cuadrantes."""
     umbral = int(TILE_LIMIT * SPLIT_FRAC)
     # 8 tiles iniciales de 90°x90° (norte, sur, oeste, este)
     pila = [((n, n - 90, w, w + 90), 0) for n in (90, 0) for w in (-180, -90, 0, 90)]
@@ -100,47 +105,58 @@ def recolectar_tiles(api, stats):
             stats["tiles_saturados"] += 1
         for v in res:
             vuelos[v.id] = v  # dedup: un vuelo en el borde puede salir en 2 tiles
-    return list(vuelos.values())
+    return vuelos
 
 
-def _str(x):
-    return None if x in (None, "", "N/A") else str(x)
-
-
-def _num(x, cast):
+def _iso_utc(t):
     try:
-        return None if x in (None, "", "N/A") else cast(x)
-    except (TypeError, ValueError):
-        return None
+        return datetime.fromtimestamp(int(t), timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return ""
 
 
-def a_tabla(vuelos, captura):
-    cols = {k: [] for k in SCHEMA.names}
-    for v in vuelos:
-        en_tierra = bool(_num(getattr(v, "on_ground", 0), int))
-        if en_tierra and not INCLUIR_EN_TIERRA:
-            continue
-        t = _num(getattr(v, "time", None), int)
-        cols["captura_utc"].append(captura)
-        cols["posicion_utc"].append(datetime.fromtimestamp(t, timezone.utc) if t else None)
-        cols["id"].append(_str(v.id))
-        cols["icao24"].append(_str(getattr(v, "icao_24bit", None)))
-        cols["aerolinea"].append(_str(getattr(v, "airline_icao", None)))
-        cols["vuelo"].append(_str(getattr(v, "callsign", None)))
-        cols["numero"].append(_str(getattr(v, "number", None)))
-        cols["matricula"].append(_str(getattr(v, "registration", None)))
-        cols["tipo_aeronave"].append(_str(getattr(v, "aircraft_code", None)))
-        cols["origen"].append(_str(getattr(v, "origin_airport_iata", None)))
-        cols["destino"].append(_str(getattr(v, "destination_airport_iata", None)))
-        cols["latitud"].append(_num(getattr(v, "latitude", None), float))
-        cols["longitud"].append(_num(getattr(v, "longitude", None), float))
-        cols["altitud"].append(_num(getattr(v, "altitude", None), int))
-        cols["velocidad_nudos"].append(_num(getattr(v, "ground_speed", None), int))
-        cols["rumbo"].append(_num(getattr(v, "heading", None), int))
-        cols["velocidad_vertical"].append(_num(getattr(v, "vertical_speed", None), int))
-        cols["en_tierra"].append(en_tierra)
-        cols["squawk"].append(_str(getattr(v, "squawk", None)))
-    return pa.Table.from_pydict(cols, schema=SCHEMA)
+def fila(v, fecha_hora_captura, captura_utc, en_muestra_global):
+    # Las 9 primeras claves son exactamente las del notebook, con los valores
+    # crudos de la librería (sin limpiar "N/A" ni ""), para no alterar los datos.
+    return {
+        "fecha_hora_captura": fecha_hora_captura,
+        "id": v.id,
+        "aerolinea": v.airline_icao,
+        "vuelo": v.callsign,
+        "latitud": v.latitude,
+        "longitud": v.longitude,
+        "altitud": v.altitude,
+        "velocidad_nudos": v.ground_speed,
+        "rumbo": v.heading,
+        # --- extras ---
+        "captura_utc": captura_utc,
+        "posicion_utc": _iso_utc(getattr(v, "time", None)),
+        "icao24": getattr(v, "icao_24bit", None),
+        "numero": getattr(v, "number", None),
+        "matricula": getattr(v, "registration", None),
+        "tipo_aeronave": getattr(v, "aircraft_code", None),
+        "origen": getattr(v, "origin_airport_iata", None),
+        "destino": getattr(v, "destination_airport_iata", None),
+        "velocidad_vertical": getattr(v, "vertical_speed", None),
+        "squawk": getattr(v, "squawk", None),
+        "en_muestra_global": en_muestra_global,
+    }
+
+
+def construir_filas(globales, por_tiles, captura):
+    """Primero las filas de la request global (mismo orden que el notebook),
+    luego las que solo aparecieron en los cuadrantes."""
+    fecha_local = captura.astimezone(TZ_CAPTURA).strftime("%Y-%m-%d %H:%M:%S")
+    captura_utc = captura.isoformat()
+    filas, ids_globales = [], set()
+    for v in globales:
+        ids_globales.add(v.id)
+        if not v.on_ground:  # mismo filtro que el notebook
+            filas.append(fila(v, fecha_local, captura_utc, True))
+    for vid, v in por_tiles.items():
+        if vid not in ids_globales and not v.on_ground:
+            filas.append(fila(v, fecha_local, captura_utc, False))
+    return filas
 
 
 def main():
@@ -150,33 +166,37 @@ def main():
     captura = datetime.now(timezone.utc).replace(microsecond=0)
     stats = {
         "modo": MODO, "captura_utc": captura.isoformat(), "requests": 0, "errores": 0,
-        "divisiones": 0, "tiles_saturados": 0, "tiles_sin_pedir": 0,
+        "divisiones": 0, "tiles_saturados": 0, "tiles_sin_pedir": 0, "global_ok": False,
     }
     try:
         api = FlightRadar24API(timeout=HTTP_TIMEOUT_S)
-        if MODO == "global":
-            vuelos = recolectar_global(api, stats)
-        elif MODO == "tiles":
-            vuelos = recolectar_tiles(api, stats)
-        else:
+        if MODO not in ("global", "tiles"):
             sys.exit(f"MODO desconocido: {MODO}")
 
-        stats["vuelos_recibidos"] = len(vuelos)
-        tabla = a_tabla(vuelos, captura)
-        stats["filas"] = tabla.num_rows
-        if tabla.num_rows == 0:
+        # 1) La request del notebook, siempre primero.
+        try:
+            globales = recolectar_global(api, stats)
+            stats["global_ok"] = True
+        except Exception as e:
+            globales = []
+            stats["errores"] += 1
+            stats["ultimo_error"] = repr(e)[:300]
+        # 2) Cobertura adicional por cuadrantes.
+        por_tiles = recolectar_tiles(api, stats) if MODO == "tiles" else {}
+
+        filas = construir_filas(globales, por_tiles, captura)
+        stats.update(vuelos_globales=len(globales), vuelos_tiles=len(por_tiles), filas=len(filas),
+                     filas_muestra_global=sum(1 for f in filas if f["en_muestra_global"]))
+        if not filas:
             stats["estado"] = "sin_datos"
             print(json.dumps(stats))
             return 1
 
-        # Los stats de la corrida quedan dentro del Parquet: permiten auditar
-        # cobertura (tiles saturados, errores) de cada snapshot después.
-        tabla = tabla.replace_schema_metadata({"corrida": json.dumps(stats)})
-        buf = io.BytesIO()
-        pq.write_table(tabla, buf, compression="zstd", compression_level=6)
-        datos = buf.getvalue()
+        # Mismo serializador que el notebook: DataFrame(lista de dicts).to_csv(index=False)
+        csv = pd.DataFrame(filas, columns=COLUMNAS).to_csv(index=False)
+        datos = gzip.compress(csv.encode("utf-8"), compresslevel=6)
 
-        key = f"{PREFIX}/fecha={captura:%Y-%m-%d}/{captura:%H%M%S}.parquet"
+        key = f"{PREFIX}/fecha={captura:%Y-%m-%d}/{captura:%H%M%S}.csv.gz"
         s3_client().put_object(Bucket=bucket(), Key=key, Body=datos)
         signal.alarm(0)
 

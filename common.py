@@ -1,36 +1,26 @@
-"""Configuración, esquema y cliente S3 compartidos por collector.py y compact.py."""
+"""Configuración, columnas y cliente S3 compartidos por collector.py y compact.py."""
 import os
 import sys
 
 import boto3
-import pyarrow as pa
 from botocore.config import Config
 
-# Esquema fijo: todos los archivos tienen exactamente estos tipos, así la
-# compactación y las consultas (DuckDB/Polars) no sufren por inferencia de tipos.
-# float32 en lat/lon: FR24 entrega 4 decimales (~11 m); float32 a 180° tiene
-# resolución ~1.5e-5° (~1.7 m), así que no se pierde información y ahorra espacio.
-SCHEMA = pa.schema([
-    ("captura_utc", pa.timestamp("s", tz="UTC")),   # cuándo corrió el collector
-    ("posicion_utc", pa.timestamp("s", tz="UTC")),  # timestamp de la posición según FR24
-    ("id", pa.string()),                 # id de vuelo de FR24 (clave de trayectoria)
-    ("icao24", pa.string()),             # transponder hex
-    ("aerolinea", pa.string()),          # ICAO de aerolínea
-    ("vuelo", pa.string()),              # callsign
-    ("numero", pa.string()),             # número de vuelo comercial
-    ("matricula", pa.string()),
-    ("tipo_aeronave", pa.string()),
-    ("origen", pa.string()),             # IATA
-    ("destino", pa.string()),            # IATA
-    ("latitud", pa.float32()),
-    ("longitud", pa.float32()),
-    ("altitud", pa.int32()),             # ft
-    ("velocidad_nudos", pa.int32()),     # kts
-    ("rumbo", pa.int16()),               # grados
-    ("velocidad_vertical", pa.int32()),  # ft/min
-    ("en_tierra", pa.bool_()),
-    ("squawk", pa.string()),
-])
+# Las 9 columnas del notebook, en el mismo orden y con los mismos nombres.
+# Sus valores se escriben tal como los entrega la librería (incluido "N/A" y ""),
+# igual que hacía el notebook con DataFrame(...).to_csv().
+COLUMNAS_NOTEBOOK = [
+    "fecha_hora_captura", "id", "aerolinea", "vuelo", "latitud", "longitud",
+    "altitud", "velocidad_nudos", "rumbo",
+]
+# Columnas agregadas, siempre AL FINAL para no mover las originales.
+COLUMNAS_EXTRA = [
+    "captura_utc",          # misma captura que fecha_hora_captura, en UTC ISO-8601 (sin ambigüedad de horario de verano)
+    "posicion_utc",         # timestamp de la posición según FR24
+    "icao24", "numero", "matricula", "tipo_aeronave", "origen", "destino",
+    "velocidad_vertical", "squawk",
+    "en_muestra_global",    # True = la fila viene de la misma request única que hacía el notebook
+]
+COLUMNAS = COLUMNAS_NOTEBOOK + COLUMNAS_EXTRA
 
 
 def env(name, default=None):
@@ -45,7 +35,7 @@ def require(name):
     return v
 
 
-PREFIX = (env("S3_PREFIX", "vuelos")).strip("/")
+PREFIX = (env("S3_PREFIX", "vuelos-csv")).strip("/")
 
 
 def bucket():
